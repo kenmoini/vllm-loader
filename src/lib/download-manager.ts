@@ -1,6 +1,7 @@
 import { EventEmitter } from "events";
 import fs from "fs";
 import path from "path";
+import { spawn } from "child_process";
 import { v4 as uuidv4 } from "uuid";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
@@ -16,6 +17,7 @@ import { modelRegistry } from "./model-registry";
 interface ManagedDownload {
   info: Download;
   abortController?: AbortController;
+  childProcess?: ReturnType<typeof spawn>;
   startTime: number;
   lastUpdate: number;
 }
@@ -392,6 +394,233 @@ class DownloadManager extends EventEmitter {
     await pipeline(nodeReadable, writeStream);
   }
 
+  async downloadFromHuggingFace(
+    name: string,
+    repoId: string,
+    hfFilename: string,
+    revision?: string
+  ): Promise<Download> {
+    // Validate inputs
+    if (!repoId || !hfFilename) {
+      throw new Error("Repository ID and filename are required");
+    }
+
+    // Sanitize filename for local storage
+    const localFilename = hfFilename.endsWith(".gguf")
+      ? hfFilename
+      : `${name.replace(/[^a-zA-Z0-9-_]/g, "_")}.gguf`;
+
+    const downloadId = uuidv4();
+    const destPath = modelRegistry.getModelPath(localFilename);
+
+    const download: Download = {
+      id: downloadId,
+      name,
+      filename: localFilename,
+      source: { type: "huggingface", repoId, filename: hfFilename, revision },
+      status: "pending",
+      progress: { downloaded: 0, total: 0, percent: 0 },
+      startedAt: new Date().toISOString(),
+    };
+
+    const managed: ManagedDownload = {
+      info: download,
+      startTime: Date.now(),
+      lastUpdate: Date.now(),
+    };
+
+    this.downloads.set(downloadId, managed);
+    this.updateStatus(downloadId, "downloading");
+
+    // Start download in background using hf CLI
+    this.performHuggingFaceDownload(downloadId, repoId, hfFilename, destPath, revision)
+      .then((fileSize) => {
+        const model = modelRegistry.register(name, localFilename, fileSize, {
+          type: "huggingface",
+          repoId,
+          filename: hfFilename,
+          revision,
+        });
+
+        this.updateStatus(downloadId, "completed");
+        this.emitEvent({
+          type: "complete",
+          downloadId,
+          timestamp: new Date().toISOString(),
+          data: { modelId: model.id },
+        });
+      })
+      .catch((error) => {
+        // Clean up partial file
+        try {
+          if (fs.existsSync(destPath)) {
+            fs.unlinkSync(destPath);
+          }
+        } catch {}
+
+        if (error.message === "Download cancelled") {
+          this.updateStatus(downloadId, "cancelled");
+        } else {
+          this.updateStatus(downloadId, "error", error.message);
+        }
+      });
+
+    return download;
+  }
+
+  private performHuggingFaceDownload(
+    downloadId: string,
+    repoId: string,
+    hfFilename: string,
+    destPath: string,
+    revision?: string
+  ): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const managed = this.downloads.get(downloadId);
+      if (!managed) {
+        reject(new Error("Download not found"));
+        return;
+      }
+
+      // Build hf download command
+      // hf download <repo_id> <filename> --local-dir <dir> --local-dir-use-symlinks false
+      const args = [
+        "download",
+        "--local-dir",
+        path.dirname(destPath),
+        repoId,
+        hfFilename,
+      ];
+
+      if (revision) {
+        args.push("--revision", revision);
+      }
+
+      // Check for HF token in environment
+      const env = { ...process.env };
+      if (process.env.HF_TOKEN) {
+        env.HF_TOKEN = process.env.HF_TOKEN;
+      }
+
+      const hfProcess = spawn("hf", args, { env });
+      managed.childProcess = hfProcess;
+
+      let stderr = "";
+      let lastProgressUpdate = Date.now();
+
+      hfProcess.stdout.on("data", (data: Buffer) => {
+        const output = data.toString();
+        console.log(`[HF Download ${downloadId}] ${output}`);
+
+        // Parse progress from hf CLI output
+        // The hf CLI outputs progress like: "Downloading model.gguf: 45%|████      | 2.5G/5.5G"
+        const progressMatch = output.match(/(\d+)%\|.*\|\s*([\d.]+[KMGT]?B?)\s*\/\s*([\d.]+[KMGT]?B?)/i);
+        if (progressMatch) {
+          const percent = parseInt(progressMatch[1], 10);
+          const downloaded = this.parseSize(progressMatch[2]);
+          const total = this.parseSize(progressMatch[3]);
+
+          if (Date.now() - lastProgressUpdate >= 100) {
+            lastProgressUpdate = Date.now();
+            managed.info.progress = {
+              downloaded,
+              total,
+              percent,
+              speed: undefined,
+              eta: undefined,
+            };
+            this.emitEvent({
+              type: "progress",
+              downloadId,
+              timestamp: new Date().toISOString(),
+              data: { progress: managed.info.progress },
+            });
+          }
+        }
+      });
+
+      hfProcess.stderr.on("data", (data: Buffer) => {
+        const output = data.toString();
+        stderr += output;
+        console.error(`[HF Download ${downloadId}] stderr: ${output}`);
+
+        // hf CLI also outputs progress to stderr sometimes
+        const progressMatch = output.match(/(\d+)%\|.*\|\s*([\d.]+[KMGT]?B?)\s*\/\s*([\d.]+[KMGT]?B?)/i);
+        if (progressMatch) {
+          const percent = parseInt(progressMatch[1], 10);
+          const downloaded = this.parseSize(progressMatch[2]);
+          const total = this.parseSize(progressMatch[3]);
+
+          if (Date.now() - lastProgressUpdate >= 100) {
+            lastProgressUpdate = Date.now();
+            managed.info.progress = {
+              downloaded,
+              total,
+              percent,
+              speed: undefined,
+              eta: undefined,
+            };
+            this.emitEvent({
+              type: "progress",
+              downloadId,
+              timestamp: new Date().toISOString(),
+              data: { progress: managed.info.progress },
+            });
+          }
+        }
+      });
+
+      hfProcess.on("close", (code) => {
+        managed.childProcess = undefined;
+
+        if (code === 0) {
+          // Get the downloaded file - hf downloads to a specific structure
+          // The file will be at: <local-dir>/<filename>
+          const downloadedPath = path.join(path.dirname(destPath), hfFilename);
+
+          // If the file is in a subdirectory, move it to destPath
+          if (downloadedPath !== destPath && fs.existsSync(downloadedPath)) {
+            fs.renameSync(downloadedPath, destPath);
+          }
+
+          if (fs.existsSync(destPath)) {
+            const stats = fs.statSync(destPath);
+            resolve(stats.size);
+          } else {
+            reject(new Error("Downloaded file not found"));
+          }
+        } else if (code === null) {
+          reject(new Error("Download cancelled"));
+        } else {
+          reject(new Error(`hf download failed with code ${code}: ${stderr}`));
+        }
+      });
+
+      hfProcess.on("error", (error) => {
+        managed.childProcess = undefined;
+        reject(new Error(`Failed to spawn hf process: ${error.message}`));
+      });
+    });
+  }
+
+  private parseSize(sizeStr: string): number {
+    const match = sizeStr.match(/([\d.]+)\s*([KMGT]?)B?/i);
+    if (!match) return 0;
+
+    const value = parseFloat(match[1]);
+    const unit = match[2].toUpperCase();
+
+    const multipliers: Record<string, number> = {
+      "": 1,
+      K: 1024,
+      M: 1024 * 1024,
+      G: 1024 * 1024 * 1024,
+      T: 1024 * 1024 * 1024 * 1024,
+    };
+
+    return value * (multipliers[unit] || 1);
+  }
+
   cancel(downloadId: string): boolean {
     const managed = this.downloads.get(downloadId);
     if (!managed) return false;
@@ -400,7 +629,14 @@ class DownloadManager extends EventEmitter {
       return false;
     }
 
+    // Cancel fetch-based downloads
     managed.abortController?.abort();
+
+    // Kill child process for HF downloads
+    if (managed.childProcess) {
+      managed.childProcess.kill("SIGTERM");
+    }
+
     return true;
   }
 

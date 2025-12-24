@@ -32,6 +32,7 @@ services:
     volumes:
       - ./models:/models       # Persist downloaded models
       - ./data:/app/data       # Persist registry and state
+      - /dev/shm:/shm        # Shared memory for KVCached/vLLM
     deploy:
       resources:
         reservations:
@@ -40,7 +41,9 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-    shm_size: '8gb'  # Shared memory for vLLM
+    privileged: true
+    ipc: host
+    shm_size: '32gb'  # Shared memory for KVCached/vLLM
 
 # Optional: Create volumes for persistence
 volumes:

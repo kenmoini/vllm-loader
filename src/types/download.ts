@@ -19,10 +19,14 @@ export interface Download {
 }
 
 export interface DownloadSource {
-  type: "url" | "s3";
+  type: "url" | "s3" | "huggingface";
   url?: string;
   bucket?: string;
   key?: string;
+  // Hugging Face specific
+  repoId?: string;
+  filename?: string;
+  revision?: string;
 }
 
 export interface DownloadProgress {

@@ -37,7 +37,7 @@ vllm-loader/
 
 ```bash
 # Copy env template
-cp .env.example .env.local
+cp example.env .env.local
 # Edit .env.local with your credentials
 
 # Install and run
