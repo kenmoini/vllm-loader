@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  vllm-loader:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: vllm-loader
+    runtime: nvidia
+    environment:
+      # Authentication (required)
+      - AUTH_USERNAME=${AUTH_USERNAME:-admin}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-changeme}
+      - AUTH_SECRET=${AUTH_SECRET:-change-me-to-a-secure-secret}
+
+      # Paths
+      - MODELS_PATH=/models
+      - DATA_PATH=/app/data
+      - VLLM_EXECUTABLE=/opt/venv/bin/vllm
+
+      # AWS S3 (optional)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+
+      # NVIDIA
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    ports:
+      - "3000:3000"          # NextJS web interface
+      - "8000-8100:8000-8100" # vLLM instances
+    volumes:
+      - ./models:/models       # Persist downloaded models
+      - ./data:/app/data       # Persist registry and state
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    shm_size: '8gb'  # Shared memory for vLLM
+
+# Optional: Create volumes for persistence
+volumes:
+  models:
+  data:
