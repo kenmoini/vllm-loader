@@ -10,6 +10,7 @@
 
 ## Project Structure
 
+```
 vllm-loader/
 ├── docker/
 │   ├── Dockerfile          # Multi-stage: Node + CUDA + vLLM
@@ -32,6 +33,7 @@ vllm-loader/
 │   ├── components/         # UI components
 │   └── types/              # TypeScript definitions
 └── .env.example            # Environment template
+```
 
 ## To Run Locally (Development)
 
